@@ -1,0 +1,31 @@
+name: Sync from upstream
+
+on:
+  schedule:
+    - cron: '0 3 * * 1'   # Mondays 03:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Merge upstream into fork
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh api -X POST repos/${{ github.repository }}/merge-upstream \
+            -f branch=${{ github.ref_name }}
+
+      - name: Open issue on failure
+        if: failure()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh issue create \
+            --title "Auto-sync from upstream failed - $(date -u +%Y-%m-%d)" \
+            --body "The weekly upstream sync failed. Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}. Common causes: a real merge conflict (apply Section 3 of CIPP System/updating-versions.md manually) or upstream changed a workflow file (default GITHUB_TOKEN cannot push those — manual sync required this week)." \
+            --label automation
