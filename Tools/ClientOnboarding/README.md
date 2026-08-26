@@ -54,10 +54,53 @@ Install-Module Microsoft.Graph.Authentication, Microsoft.Graph.Identity.Partner,
     Microsoft.Graph.Identity.Governance, Microsoft.Graph.Groups, Microsoft.Graph.Users -Scope CurrentUser
 ```
 
-Phase 2 signs in to the client tenant with your partner credentials. On first use the
-**Microsoft Graph Command Line Tools** enterprise application needs consent in that
-tenant; the Application Administrator and Privileged Role Administrator roles in the GDAP
-role list cover granting it.
+You sign in with **your own Novix account** for both phases — never a client account.
+Phase 2 reaches the client tenant through the GDAP relationship, not through client
+credentials. On first use the **Microsoft Graph Command Line Tools** enterprise
+application needs consent in the client tenant; the Application Administrator and
+Privileged Role Administrator roles in the GDAP role list cover granting it.
+
+### Your account needs Admin agent in Partner Center
+
+Creating a GDAP relationship requires the **Admin agent** role in Partner Center.
+Global Administrator in the Novix tenant is *not* sufficient — and nothing else in
+phase 1 needs it, so without the role the script reads roles and creates all 16 groups
+quite happily before failing on one bare error:
+
+```
+New-MgTenantRelationshipDelegatedAdminRelationship : Access to the resource is restricted.
+Status: 403 (Forbidden)   ErrorCode: forbidden
+```
+
+That is what the pre-flight exists to prevent. It checks, in order of how conclusive
+each check is:
+
+1. **Granted scopes** — read off the token, not the list you asked for. Requesting a
+   scope and being granted it are different things. Hard failure.
+2. **A read probe** against delegated admin relationships. This exercises the same
+   Partner Center authorisation as creating one, so a 403 here identifies the problem
+   before a single group is created. Hard failure, with the fix in the message.
+3. **`AdminAgents` group membership** — a heuristic, because nested membership and
+   renamed groups aren't detected. Warns and asks rather than failing.
+
+Assign the role under Partner Center → Settings → Account settings → User management,
+then `Disconnect-MgGraph` and sign in again — role membership is cached in the token.
+
+### Watch which account WAM picks
+
+On Windows, `Connect-MgGraph` uses Web Account Manager by default and will often sign
+you in silently as whatever account Windows is already using, with no prompt. If you
+hold both a standard and an admin Novix account, that can quietly be the wrong one.
+The pre-flight prints the account it ended up as. To choose explicitly:
+
+```powershell
+Disconnect-MgGraph
+Connect-MgGraph -Scopes "DelegatedAdminRelationship.ReadWrite.All","Directory.ReadWrite.All",`
+    "Group.ReadWrite.All","RoleManagement.Read.Directory","User.Read.All" -UseDeviceCode
+```
+
+Device code flow bypasses WAM entirely. (Older module versions call that switch
+`-UseDeviceAuthentication`.)
 
 ## Changing the Novix support details
 

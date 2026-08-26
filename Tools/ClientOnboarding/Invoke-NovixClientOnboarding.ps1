@@ -8,6 +8,9 @@
     Runs in two phases.
 
     Phase 1 - Partner tenant (Novix)
+      * Pre-flight: confirms the token actually carries the scopes it asked for, and
+        that Partner Center will let this account touch delegated admin relationships,
+        before creating anything.
       * Ensures one security group per GDAP role exists ("M365 GDAP <Role>").
       * Optionally adds named users to every group.
       * Creates a delegated admin (GDAP) relationship for the customer, locks it for
@@ -55,7 +58,8 @@
     GDAP relationship duration. Maximum supported by Microsoft is P2Y.
 
 .PARAMETER Force
-    Skip the "you are about to write to <tenant>" confirmation in phase 2.
+    Skip the confirmation prompts: the pre-flight Admin agent warning in phase 1, and
+    the "you are about to write to <tenant>" check in phase 2.
 
 .EXAMPLE
     .\Invoke-NovixClientOnboarding.ps1 -CustomerTenantId '00000000-1111-2222-3333-444444444444'
@@ -285,6 +289,118 @@ function Set-ClipboardSafely {
     }
 }
 
+function Assert-PartnerPrerequisite {
+    <#
+        Fails before anything is created, rather than part-way through.
+
+        Creating a GDAP relationship needs the Partner Center Admin agent role, which
+        nothing else in phase 1 exercises - so without this check the script happily
+        creates 16 security groups and then dies on a bare "403 Access to the resource
+        is restricted" at the one call that needs it. Global Administrator in the
+        partner tenant is not sufficient on its own.
+
+        Checks are ordered by how conclusive they are: granted scopes are read straight
+        off the token, the read probe is a real capability test, and AdminAgents
+        membership is a heuristic that only warns.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string[]]$RequiredScope,
+        [switch]$NoConfirm
+    )
+
+    Write-Step 'Pre-flight: verifying partner permissions'
+
+    $context = Get-MgContext
+    if (-not $context) { throw 'Not connected to Microsoft Graph.' }
+
+    Write-Ok "Account: $($context.Account)"
+    Write-Ok "Tenant:  $($context.TenantId)"
+
+    # --- 1. Scopes actually granted, not merely requested --------------------
+    $missingScopes = @($RequiredScope | Where-Object { $_ -notin $context.Scopes })
+    if ($missingScopes.Count -gt 0) {
+        throw @"
+Consent is missing for: $($missingScopes -join ', ')
+
+These scopes were requested but the token does not carry them, so the run would fail
+later. Reconnect and have an administrator consent:
+
+    Disconnect-MgGraph
+    Connect-MgGraph -Scopes $($RequiredScope -join ',') -UseDeviceCode
+"@
+    }
+    Write-Ok 'All required scopes are present on the token'
+
+    # --- 2. Non-destructive capability probe ---------------------------------
+    # Reading relationships exercises the same Partner Center authorisation as
+    # creating one, so a 403 here is the answer before any group is created.
+    $probeForbidden = $false
+    try {
+        Get-MgTenantRelationshipDelegatedAdminRelationship -Top 1 -ErrorAction Stop | Out-Null
+        Write-Ok 'Partner Center access confirmed (delegated admin relationships readable)'
+    } catch {
+        if ($_.Exception.Message -match '403|forbidden|restricted') {
+            $probeForbidden = $true
+        } else {
+            Write-Warning "Could not confirm Partner Center access: $($_.Exception.Message)"
+        }
+    }
+
+    if ($probeForbidden) {
+        throw @"
+Partner Center refused access to delegated admin relationships (403 Forbidden).
+
+The required scopes are present, so this is a partner-side authorisation problem, not
+a consent problem. The usual cause is that the signed-in account does not hold the
+Admin agent role in Partner Center. Global Administrator in the partner tenant is not
+sufficient on its own, which is why every earlier step in this script works.
+
+  1. Partner Center > Settings > Account settings > User management
+  2. Assign 'Admin agent' to $($context.Account)
+  3. Disconnect-MgGraph and sign in again - role membership is cached in the token
+
+If that account already holds Admin agent, check the Partner Center dashboard for
+outstanding agreement or security-requirement warnings against the partner account.
+"@
+    }
+
+    # --- 3. Admin agent membership (heuristic - warns only) ------------------
+    # Nested membership and renamed groups are not detected, so a miss here is not
+    # proof of anything; the probe above is the authoritative check.
+    if ($context.AuthType -ne 'Delegated' -or -not $context.Account) { return }
+
+    $isAdminAgent = $null
+    try {
+        $me = Get-MgUser -UserId $context.Account -ErrorAction Stop
+        $groupNames = @(
+            Get-MgUserMemberOf -UserId $me.Id -All -ErrorAction Stop |
+                ForEach-Object { $_.AdditionalProperties.displayName }
+        )
+        $isAdminAgent = $groupNames -contains 'AdminAgents'
+    } catch {
+        Write-Warning "Could not check AdminAgents membership: $($_.Exception.Message)"
+        return
+    }
+
+    if ($isAdminAgent) {
+        Write-Ok 'Account is a member of AdminAgents (Partner Center Admin agent)'
+        return
+    }
+
+    # Deliberately outside the try/catch above, so this stop is not swallowed.
+    Write-Warning 'Account is not a direct member of the AdminAgents group.'
+    Write-Warning 'Creating a GDAP relationship requires the Partner Center Admin agent role.'
+    Write-Warning 'Nested membership and renamed groups are not detected here, so this may be a false alarm.'
+
+    if ($NoConfirm -or $WhatIfPreference) { return }
+
+    $answer = Read-Host 'Continue anyway? (y/N)'
+    if ($answer -notmatch '^(y|yes)$') {
+        throw 'Stopped at pre-flight. Nothing was created.'
+    }
+}
+
 #endregion
 
 #region Phase 1 - partner tenant ---------------------------------------------
@@ -294,21 +410,25 @@ function Invoke-GdapOnboarding {
     param(
         [Parameter(Mandatory)][string]$CustomerTenantId,
         [string[]]$GroupMember = @(),
-        [string]$Duration = 'P2Y'
+        [string]$Duration = 'P2Y',
+        [switch]$NoConfirm
     )
 
     Write-Step 'Phase 1: connecting to the Novix partner tenant'
 
-    Connect-MgGraph -Scopes @(
+    # Sign in with your own Novix (partner) account, not a customer account - the
+    # customer tenant is reached in phase 2 through the GDAP relationship.
+    $partnerScopes = @(
         'DelegatedAdminRelationship.ReadWrite.All'
         'Directory.ReadWrite.All'
         'Group.ReadWrite.All'
         'RoleManagement.Read.Directory'
         'User.Read.All'
-    ) -NoWelcome
+    )
 
-    $context = Get-MgContext
-    Write-Ok "Signed in as $($context.Account) in tenant $($context.TenantId)"
+    Connect-MgGraph -Scopes $partnerScopes -NoWelcome
+
+    Assert-PartnerPrerequisite -RequiredScope $partnerScopes -NoConfirm:$NoConfirm
 
     # --- Resolve role definitions --------------------------------------------
     Write-Step 'Resolving Entra role definitions'
@@ -770,7 +890,8 @@ if (-not $SkipGdap) {
 
     Invoke-GdapOnboarding -CustomerTenantId $CustomerTenantId `
         -GroupMember $GdapGroupMember `
-        -Duration $RelationshipDurationIso8601
+        -Duration $RelationshipDurationIso8601 `
+        -NoConfirm:$Force
 } else {
     Write-Skip 'Phase 1 skipped (-SkipGdap)'
 }
